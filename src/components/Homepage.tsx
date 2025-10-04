@@ -1,4 +1,4 @@
-import { BookOpen, Brain, CheckCircle, ArrowRight, Sparkles, Crown, Gift } from 'lucide-react';
+import { BookOpen, Brain, CheckCircle, ArrowRight, Sparkles, Crown, Gift, Zap } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 
