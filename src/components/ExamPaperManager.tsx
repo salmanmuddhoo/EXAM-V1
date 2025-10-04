@@ -160,68 +160,73 @@ export function ExamPaperManager() {
       }
 
       try {
-        setProcessingStatus('Converting PDF to images...');
+  setProcessingStatus('Converting PDF to images...');
 
-        const pageImages = examPaperImages.map((part, index) => ({
-          pageNumber: index + 1,
-          base64Image: part.inlineData.data,
-        }));
+  // Validate we have images
+  if (examPaperImages.length === 0) {
+    throw new Error('No images extracted from PDF. Please try again.');
+  }
 
-        let markingSchemeImageData: Array<{ pageNumber: number; base64Image: string }> = [];
+  const pageImages = examPaperImages.map((part, index) => ({
+    pageNumber: index + 1,
+    base64Image: part.inlineData.data,
+  }));
 
-        if (markingSchemeFile) {
-          const {convertPdfToBase64Images} = await import('../lib/pdfUtils');
-          setProcessingStatus('Converting marking scheme to images...');
-          const schemeImages = await convertPdfToBase64Images(markingSchemeFile);
-          markingSchemeImageData = schemeImages.map((part, index) => ({
-            pageNumber: index + 1,
-            base64Image: part.inlineData.data,
-          }));
-        }
+  console.log(`✅ Prepared ${pageImages.length} pages for AI processing`);
+  console.log(`📊 First page base64 length: ${pageImages[0]?.base64Image?.length || 0} chars`);
 
-        setProcessingStatus('Running OCR and detecting questions...');
+  setProcessingStatus('Running AI to extract and split questions...');
 
-        const processingResponse = await fetch(
-          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-exam-paper`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-            },
-            body: JSON.stringify({
-              examPaperId: examPaper.id,
-              examPaperPath: examPaperUpload.path,
-              markingSchemeId: markingSchemeId,
-              markingSchemePath: markingSchemePath,
-              pageImages: pageImages,
-              markingSchemeImages: markingSchemeImageData.length > 0 ? markingSchemeImageData : undefined,
-            }),
-          }
-        );
+  const processingResponse = await fetch(
+    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-exam-paper`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({
+        examPaperId: examPaper.id,
+        pageImages: pageImages,
+      }),
+    }
+  );
 
-        if (!processingResponse.ok) {
-          console.warn('Processing function not available yet. PDF uploaded but not processed.');
-          setProcessingStatus('');
-          setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
-          setExamPaperFile(null);
-          setMarkingSchemeFile(null);
-          setIsAdding(false);
-          fetchData();
-          alert('Exam paper uploaded successfully! Note: Question optimization not yet available. Please deploy the process-exam-paper Edge Function.');
-        } else {
-          const processingResult = await processingResponse.json();
-          console.log('Processing result:', processingResult);
+  console.log(`📡 Response status: ${processingResponse.status}`);
 
-          setProcessingStatus('');
-          setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
-          setExamPaperFile(null);
-          setMarkingSchemeFile(null);
-          setIsAdding(false);
-          fetchData();
-          alert(`Exam paper uploaded and processed successfully! Detected ${processingResult.examQuestionsCount} questions.`);
-        }
-      } catch (processingError) {
+  if (!processingResponse.ok) {
+    const errorText = await processingResponse.text();
+    console.error('❌ Processing error:', errorText);
+    throw new Error(`AI processing failed: ${errorText}`);
+  }
+
+  const processingResult = await processingResponse.json();
+  console.log('📥 AI Result:', processingResult);
+
+  setProcessingStatus('');
+  setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
+  setExamPaperFile(null);
+  setMarkingSchemeFile(null);
+  setExamPaperImages([]);
+  setIsAdding(false);
+  fetchData();
+
+  if (processingResult.questionsCount > 0) {
+    alert(`✅ Success! Detected ${processingResult.questionsCount} questions:\n${processingResult.questions?.map((q: any) => `• Question ${q.number}`).join('\n')}`);
+  } else {
+    alert('⚠️ Upload successful but no questions detected. Check the console logs and your Supabase function logs for details.');
+  }
+} catch (processingError) {
+  console.error('❌ Processing error:', processingError);
+  setProcessingStatus('');
+  setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
+  setExamPaperFile(null);
+  setMarkingSchemeFile(null);
+  setExamPaperImages([]);
+  setIsAdding(false);
+  fetchData();
+  alert('Exam paper uploaded successfully! Note: Automatic question processing failed. Error: ' + processingError.message);
+} catch (processingError) {
         console.warn('Processing error (non-fatal):', processingError);
         setProcessingStatus('');
         setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
