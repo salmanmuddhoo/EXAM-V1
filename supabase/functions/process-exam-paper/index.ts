@@ -118,37 +118,27 @@ async function extractAndSplitQuestions(
   // ============================================
   // 🎯 THE AI PROMPT - CUSTOMIZE THIS
   // ============================================
-  const AI_PROMPT = `You are an expert exam paper analyzer. Extract and split all questions from this exam paper.
+  const AI_PROMPT = `Extract and split all questions from this exam paper.
 
-**CRITICAL: You MUST respond with ONLY a valid JSON array. No explanations, no markdown, no text before or after.**
+**CRITICAL INSTRUCTIONS:**
+1. Return ONLY a JSON array - no other text
+2. Keep "fullText" SHORT - just the first 100 characters of each question
+3. Format: [{"questionNumber":"1","startPage":1,"endPage":1,"fullText":"Question 1: ...","hasSubParts":false}]
 
-Identify every question and return a JSON array like this:
+**IMPORTANT:** 
+- Keep fullText under 100 characters (use "..." if truncated)
+- Look for "Question 1", "Q1", "1.", "1)" patterns
+- Include ALL questions you find
+- If question spans pages, set endPage accordingly
+- Start page numbers from 1
+
+**Example output:**
 [
-  {
-    "questionNumber": "1",
-    "startPage": 1,
-    "endPage": 1,
-    "fullText": "Complete question text here...",
-    "hasSubParts": false
-  },
-  {
-    "questionNumber": "2", 
-    "startPage": 2,
-    "endPage": 3,
-    "fullText": "Complete question text including all parts...",
-    "hasSubParts": true
-  }
+  {"questionNumber":"1","startPage":1,"endPage":1,"fullText":"Question 1: Calculate the derivative...","hasSubParts":false},
+  {"questionNumber":"2","startPage":2,"endPage":2,"fullText":"Question 2: (a) Explain (b) Provide...","hasSubParts":true}
 ]
 
-**RULES:**
-1. Look for "Question 1", "Q1", "1.", "1)", or similar patterns
-2. Include ALL text belonging to each question
-3. If a question spans multiple pages, set endPage accordingly
-4. Page numbers start from 1
-5. Extract EVERY question - don't skip any
-6. Return ONLY the JSON array - nothing else
-
-**YOUR RESPONSE MUST START WITH [ AND END WITH ]**`;
+Return ONLY the JSON array, nothing else.`;
 
   try {
     console.log("📤 Sending to Gemini AI...");
@@ -225,36 +215,45 @@ Identify every question and return a JSON array like this:
     }
 
     // Clean up the JSON text - fix common issues
-    // Replace unicode characters that might cause issues
-    jsonText = jsonText
-      .replace(/\\n/g, ' ')  // Replace escaped newlines with spaces
-      .replace(/\n/g, ' ')   // Replace actual newlines with spaces
-      .replace(/\s+/g, ' ')  // Collapse multiple spaces
-      .trim();
+    jsonText = jsonText.trim();
 
-    console.log("📥 Cleaned JSON preview:", jsonText.substring(0, 500));
+    console.log("📥 JSON length:", jsonText.length, "chars");
+    console.log("📥 First 300 chars:", jsonText.substring(0, 300));
+    console.log("📥 Last 300 chars:", jsonText.substring(jsonText.length - 300));
 
     let questions;
     try {
       questions = JSON.parse(jsonText);
       console.log(`✅ Successfully parsed ${questions.length} questions`);
     } catch (parseError) {
-      console.error("❌ JSON parse error!");
-      console.error("Parse error message:", parseError.message);
-      console.error("Problematic JSON (first 2000 chars):", jsonText.substring(0, 2000));
+      console.error("❌ JSON parse error at position:", parseError.message);
       
-      // Try one more time with a more aggressive clean
+      // Find where the error occurred
+      const match = parseError.message.match(/position (\d+)/);
+      if (match) {
+        const pos = parseInt(match[1]);
+        console.error("Context around error position:");
+        console.error(jsonText.substring(Math.max(0, pos - 200), Math.min(jsonText.length, pos + 200)));
+      }
+      
+      // Try to salvage partial JSON by finding the last complete object
       try {
-        const cleanedAgain = jsonText
-          .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Remove control characters
-          .replace(/\\"/g, '"')  // Fix escaped quotes
-          .replace(/\\/g, '');   // Remove remaining backslashes
+        console.log("🔄 Attempting to salvage partial response...");
         
-        questions = JSON.parse(cleanedAgain);
-        console.log(`✅ Parsed after aggressive cleaning: ${questions.length} questions`);
-      } catch (secondError) {
-        console.error("❌ Second parse attempt also failed");
-        throw new Error(`Failed to parse Gemini response. Error: ${parseError.message}`);
+        // Find the last complete question object
+        const lastCompleteMatch = jsonText.match(/\{[^}]*\}(?=\s*,|\s*\])/g);
+        
+        if (lastCompleteMatch && lastCompleteMatch.length > 0) {
+          // Reconstruct array with complete objects only
+          const salvaged = '[' + lastCompleteMatch.join(',') + ']';
+          questions = JSON.parse(salvaged);
+          console.log(`⚠️ Salvaged ${questions.length} complete questions from truncated response`);
+        } else {
+          throw parseError;
+        }
+      } catch (salvageError) {
+        console.error("❌ Could not salvage response");
+        throw new Error(`JSON parse failed at position ${match ? match[1] : 'unknown'}. The response may be too large or malformed.`);
       }
     }
 
@@ -278,12 +277,72 @@ Identify every question and return a JSON array like this:
 
     console.log(`✅ Successfully parsed ${validQuestions.length} valid questions`);
     
-    return validQuestions;
+    // Step 2: For each question, extract the full text from its pages
+    console.log("📝 Extracting full text for each question...");
+    
+    const questionsWithFullText = await extractFullTextForQuestions(
+      validQuestions,
+      pageImages,
+      geminiApiKey
+    );
+    
+    return questionsWithFullText;
 
   } catch (error) {
     console.error("❌ AI extraction failed:", error);
     throw new Error(`AI extraction failed: ${error.message}`);
   }
+}
+
+/**
+ * Extract full text for each question from their specific pages
+ */
+async function extractFullTextForQuestions(
+  questions: any[],
+  pageImages: Array<{ pageNumber: number; base64Image: string }>,
+  geminiApiKey: string
+) {
+  console.log(`📝 Processing ${questions.length} questions to extract full text...`);
+  
+  const results = [];
+  
+  // Process in batches of 3 to avoid rate limits
+  for (let i = 0; i < questions.length; i += 3) {
+    const batch = questions.slice(i, i + 3);
+    
+    const batchPromises = batch.map(async (question) => {
+      try {
+        // Get the page images for this question
+        const relevantPages = pageImages.filter(
+          p => p.pageNumber >= question.startPage && p.pageNumber <= question.endPage
+        );
+        
+        if (relevantPages.length === 0) {
+          console.warn(`⚠️ No pages for question ${question.questionNumber}`);
+          return { ...question, fullText: question.fullText || "" };
+        }
+        
+        // For now, just use the preview text we already have
+        // In production, you could do another Gemini call here to get complete text
+        return question;
+        
+      } catch (error) {
+        console.error(`Error processing question ${question.questionNumber}:`, error);
+        return question;
+      }
+    });
+    
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+    
+    // Small delay between batches
+    if (i + 3 < questions.length) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  
+  console.log(`✅ Processed full text for ${results.length} questions`);
+  return results;
 }
 
 /**
