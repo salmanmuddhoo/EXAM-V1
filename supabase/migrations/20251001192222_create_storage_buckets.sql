@@ -128,3 +128,20 @@ CREATE POLICY "Admins can delete marking schemes"
       WHERE profiles.id = auth.uid() AND profiles.role = 'admin'
     )
   );
+
+-- Create the bucket
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('exam-questions', 'exam-questions', true)
+ON CONFLICT (id) DO NOTHING;
+
+-- Allow authenticated users to upload
+CREATE POLICY "Allow authenticated uploads"
+ON storage.objects FOR INSERT
+TO authenticated
+WITH CHECK (bucket_id = 'exam-questions');
+
+-- Allow anyone to view
+CREATE POLICY "Allow public downloads"
+ON storage.objects FOR SELECT
+TO public
+USING (bucket_id = 'exam-questions');
