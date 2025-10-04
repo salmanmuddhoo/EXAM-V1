@@ -159,6 +159,9 @@ export function ExamPaperManager() {
         }
       }
 
+
+/*
+      
       try {
         setProcessingStatus('Converting PDF to images...');
 
@@ -221,7 +224,90 @@ export function ExamPaperManager() {
           fetchData();
           alert(`Exam paper uploaded and processed successfully! Detected ${processingResult.examQuestionsCount} questions.`);
         }
-      } catch (processingError) {
+      } 
+*/
+
+
+      
+      
+  //new code
+try {
+  setProcessingStatus('Converting PDF to images...');
+
+  // Validate we have images
+  if (examPaperImages.length === 0) {
+    throw new Error('No images extracted from PDF. Please try again.');
+  }
+
+  const pageImages = examPaperImages.map((part, index) => ({
+    pageNumber: index + 1,
+    base64Image: part.inlineData.data,
+  }));
+
+  console.log(`✅ Prepared ${pageImages.length} pages for AI processing`);
+  console.log(`📊 First page base64 length: ${pageImages[0]?.base64Image?.length || 0} chars`);
+
+  setProcessingStatus('Running AI to extract and split questions...');
+
+  const processingResponse = await fetch(
+    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-exam-paper`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({
+        examPaperId: examPaper.id,
+        pageImages: pageImages,
+      }),
+    }
+  );
+
+  console.log(`📡 Response status: ${processingResponse.status}`);
+
+  if (!processingResponse.ok) {
+    const errorText = await processingResponse.text();
+    console.error('❌ Processing error:', errorText);
+    throw new Error(`AI processing failed: ${errorText}`);
+  }
+
+  const processingResult = await processingResponse.json();
+  console.log('📥 AI Result:', processingResult);
+
+  setProcessingStatus('');
+  setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
+  setExamPaperFile(null);
+  setMarkingSchemeFile(null);
+  setExamPaperImages([]);
+  setIsAdding(false);
+  fetchData();
+
+  if (processingResult.questionsCount > 0) {
+    alert(`✅ Success! Detected ${processingResult.questionsCount} questions:\n${processingResult.questions?.map((q: any) => `• Question ${q.number}`).join('\n')}`);
+  } else {
+    alert('⚠️ Upload successful but no questions detected. Check the console logs and your Supabase function logs for details.');
+  }
+} catch (processingError) {
+  console.error('❌ Processing error:', processingError);
+  setProcessingStatus('');
+  setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
+  setExamPaperFile(null);
+  setMarkingSchemeFile(null);
+  setExamPaperImages([]);
+  setIsAdding(false);
+  fetchData();
+  alert('Exam paper uploaded successfully! Note: Automatic question processing failed. Error: ' + processingError.message);
+}
+
+        //end new code
+
+
+
+
+  
+      
+      catch (processingError) {
         console.warn('Processing error (non-fatal):', processingError);
         setProcessingStatus('');
         setFormData({ title: '', subject_id: '', grade_level_id: '', year: new Date().getFullYear() });
