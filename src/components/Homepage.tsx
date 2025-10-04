@@ -1,10 +1,54 @@
-import { BookOpen, Brain, Lock, Zap, CheckCircle, ArrowRight } from 'lucide-react';
+import { BookOpen, Brain, CheckCircle, ArrowRight, Sparkles, Crown, Gift } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { supabase } from '../lib/supabase';
 
 interface Props {
   onGetStarted: () => void;
 }
 
+interface PlanFeatures {
+  questions_per_month: number;
+  max_papers: number;
+  chat_persistence: boolean;
+  pdf_export: boolean;
+  all_grades: boolean;
+  all_subjects: boolean;
+  grade_limit?: number;
+  subject_limit?: number;
+}
+
+interface Plan {
+  id: string;
+  name: string;
+  display_name: string;
+  monthly_price: number;
+  yearly_price: number;
+  features: PlanFeatures;
+}
+
 export function Homepage({ onGetStarted }: Props) {
+  const [plans, setPlans] = useState<Plan[]>([]);
+  const [billingCycle, setBillingCycle] = useState<'monthly' | 'yearly'>('monthly');
+
+  useEffect(() => {
+    fetchPlans();
+  }, []);
+
+  const fetchPlans = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('subscription_plans')
+        .select('*')
+        .eq('is_active', true)
+        .order('monthly_price', { ascending: true });
+
+      if (error) throw error;
+      setPlans(data || []);
+    } catch (error) {
+      console.error('Error fetching plans:', error);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-white">
       {/* Hero Section */}
@@ -22,7 +66,7 @@ export function Homepage({ onGetStarted }: Props) {
               onClick={onGetStarted}
               className="inline-flex items-center space-x-2 px-6 py-3 bg-black text-white rounded-lg hover:bg-gray-800 transition-colors text-lg font-medium"
             >
-              <span>Get Started</span>
+              <span>Get Started Free</span>
               <ArrowRight className="w-5 h-5" />
             </button>
           </div>
@@ -55,8 +99,56 @@ export function Homepage({ onGetStarted }: Props) {
         </div>
       </section>
 
-      {/* How It Works Section */}
+      {/* Pricing Section */}
       <section className="border-b border-gray-200 bg-gray-50">
+        <div className="max-w-6xl mx-auto px-4 py-16 sm:py-20">
+          <div className="text-center mb-12">
+            <h2 className="text-3xl font-bold text-gray-900 mb-4">
+              Choose Your Plan
+            </h2>
+            <p className="text-lg text-gray-600 mb-8">
+              Start free or unlock premium features with our flexible plans
+            </p>
+            <div className="inline-flex items-center bg-white rounded-lg p-1 shadow-sm">
+              <button
+                onClick={() => setBillingCycle('monthly')}
+                className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+                  billingCycle === 'monthly'
+                    ? 'bg-black text-white'
+                    : 'text-gray-700 hover:text-gray-900'
+                }`}
+              >
+                Monthly
+              </button>
+              <button
+                onClick={() => setBillingCycle('yearly')}
+                className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+                  billingCycle === 'yearly'
+                    ? 'bg-black text-white'
+                    : 'text-gray-700 hover:text-gray-900'
+                }`}
+              >
+                Yearly
+                <span className="ml-1.5 text-xs">(Save 17%)</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="grid md:grid-cols-3 gap-8">
+            {plans.map((plan) => (
+              <PricingCard
+                key={plan.id}
+                plan={plan}
+                billingCycle={billingCycle}
+                onGetStarted={onGetStarted}
+              />
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* How It Works Section */}
+      <section className="border-b border-gray-200">
         <div className="max-w-6xl mx-auto px-4 py-16 sm:py-20">
           <h2 className="text-3xl font-bold text-gray-900 text-center mb-12">
             How It Works
@@ -189,6 +281,112 @@ function Benefit({ text }: { text: string }) {
     <div className="flex items-start space-x-3">
       <CheckCircle className="w-6 h-6 text-black flex-shrink-0 mt-0.5" />
       <span className="text-gray-700">{text}</span>
+    </div>
+  );
+}
+
+function PricingCard({
+  plan,
+  billingCycle,
+  onGetStarted
+}: {
+  plan: Plan;
+  billingCycle: 'monthly' | 'yearly';
+  onGetStarted: () => void;
+}) {
+  const price = billingCycle === 'monthly' ? plan.monthly_price : plan.yearly_price;
+  const isPopular = plan.name === 'student';
+  const isFree = plan.name === 'free';
+  const isPro = plan.name === 'pro';
+
+  const getIcon = () => {
+    if (isFree) return <Gift className="w-6 h-6" />;
+    if (isPro) return <Crown className="w-6 h-6" />;
+    return <Sparkles className="w-6 h-6" />;
+  };
+
+  const getFeatureList = () => {
+    const features = [];
+
+    if (isFree) {
+      features.push(`${plan.features.questions_per_month} questions per month`);
+      features.push(`Access up to ${plan.features.max_papers} exam papers`);
+      features.push('AI tutor assistance');
+      features.push('No chat history saved');
+    } else if (plan.name === 'student') {
+      features.push('Unlimited questions');
+      features.push('1 grade level');
+      features.push('Up to 8 subjects');
+      features.push('All years available');
+      features.push('Chat history saved');
+      features.push('Access to marking schemes');
+    } else if (isPro) {
+      features.push('Everything in Student');
+      features.push('All grade levels');
+      features.push('All subjects');
+      features.push('Export chats to PDF');
+      features.push('Priority support');
+      features.push('Early access to new features');
+    }
+
+    return features;
+  };
+
+  return (
+    <div className={`relative bg-white rounded-lg shadow-sm border-2 transition-all hover:shadow-lg ${
+      isPopular ? 'border-black' : 'border-gray-200'
+    }`}>
+      {isPopular && (
+        <div className="absolute -top-4 left-1/2 transform -translate-x-1/2">
+          <span className="bg-black text-white text-xs font-semibold px-3 py-1 rounded-full">
+            Most Popular
+          </span>
+        </div>
+      )}
+
+      <div className="p-6">
+        <div className="flex items-center space-x-3 mb-4">
+          <div className={`p-2 rounded-lg ${isFree ? 'bg-gray-100' : isPro ? 'bg-gray-900 text-white' : 'bg-gray-100'}`}>
+            {getIcon()}
+          </div>
+          <div>
+            <h3 className="text-xl font-bold text-gray-900">{plan.display_name}</h3>
+          </div>
+        </div>
+
+        <div className="mb-6">
+          {isFree ? (
+            <div className="flex items-baseline">
+              <span className="text-4xl font-bold text-gray-900">Free</span>
+            </div>
+          ) : (
+            <div className="flex items-baseline">
+              <span className="text-4xl font-bold text-gray-900">${price}</span>
+              <span className="text-gray-600 ml-2">/{billingCycle === 'monthly' ? 'mo' : 'yr'}</span>
+            </div>
+          )}
+        </div>
+
+        <button
+          onClick={onGetStarted}
+          className={`w-full py-3 px-4 rounded-lg font-medium transition-colors mb-6 ${
+            isPopular || isPro
+              ? 'bg-black text-white hover:bg-gray-800'
+              : 'bg-gray-100 text-gray-900 hover:bg-gray-200'
+          }`}
+        >
+          {isFree ? 'Start Free' : 'Get Started'}
+        </button>
+
+        <div className="space-y-3">
+          {getFeatureList().map((feature, index) => (
+            <div key={index} className="flex items-start space-x-2">
+              <CheckCircle className="w-5 h-5 text-black flex-shrink-0 mt-0.5" />
+              <span className="text-sm text-gray-700">{feature}</span>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

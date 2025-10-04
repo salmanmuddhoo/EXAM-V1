@@ -145,30 +145,33 @@ export interface Database {
           updated_at?: string
         }
       }
-      chat_conversations: {
+      conversations: {
         Row: {
           id: string
-          student_id: string | null
+          user_id: string
           exam_paper_id: string
+          title: string
           created_at: string
           updated_at: string
         }
         Insert: {
           id?: string
-          student_id?: string | null
+          user_id: string
           exam_paper_id: string
+          title: string
           created_at?: string
           updated_at?: string
         }
         Update: {
           id?: string
-          student_id?: string | null
+          user_id?: string
           exam_paper_id?: string
+          title?: string
           created_at?: string
           updated_at?: string
         }
       }
-      chat_messages: {
+      conversation_messages: {
         Row: {
           id: string
           conversation_id: string
@@ -189,6 +192,175 @@ export interface Database {
           role?: 'user' | 'assistant'
           content?: string
           created_at?: string
+        }
+      }
+      subscription_plans: {
+        Row: {
+          id: string
+          name: 'free' | 'student' | 'pro'
+          display_name: string
+          monthly_price: number
+          yearly_price: number
+          features: Json
+          is_active: boolean
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          name: 'free' | 'student' | 'pro'
+          display_name: string
+          monthly_price?: number
+          yearly_price?: number
+          features?: Json
+          is_active?: boolean
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          name?: 'free' | 'student' | 'pro'
+          display_name?: string
+          monthly_price?: number
+          yearly_price?: number
+          features?: Json
+          is_active?: boolean
+          created_at?: string
+          updated_at?: string
+        }
+      }
+      user_subscriptions: {
+        Row: {
+          id: string
+          user_id: string
+          plan_id: string
+          billing_cycle: 'monthly' | 'yearly' | 'one_time'
+          status: 'active' | 'expired' | 'cancelled'
+          selected_grade_id: string | null
+          selected_subject_ids: string[]
+          started_at: string
+          expires_at: string | null
+          cancelled_at: string | null
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          plan_id: string
+          billing_cycle: 'monthly' | 'yearly' | 'one_time'
+          status?: 'active' | 'expired' | 'cancelled'
+          selected_grade_id?: string | null
+          selected_subject_ids?: string[]
+          started_at?: string
+          expires_at?: string | null
+          cancelled_at?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          plan_id?: string
+          billing_cycle?: 'monthly' | 'yearly' | 'one_time'
+          status?: 'active' | 'expired' | 'cancelled'
+          selected_grade_id?: string | null
+          selected_subject_ids?: string[]
+          started_at?: string
+          expires_at?: string | null
+          cancelled_at?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+      }
+      user_usage_tracking: {
+        Row: {
+          id: string
+          user_id: string
+          month_year: string
+          questions_asked: number
+          papers_accessed: string[]
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          month_year: string
+          questions_asked?: number
+          papers_accessed?: string[]
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          month_year?: string
+          questions_asked?: number
+          papers_accessed?: string[]
+          created_at?: string
+          updated_at?: string
+        }
+      }
+      subscription_config: {
+        Row: {
+          id: string
+          key: string
+          value: Json
+          description: string | null
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          key: string
+          value: Json
+          description?: string | null
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          key?: string
+          value?: Json
+          description?: string | null
+          updated_at?: string
+        }
+      }
+      purchase_history: {
+        Row: {
+          id: string
+          user_id: string
+          subscription_id: string | null
+          plan_id: string
+          amount: number
+          billing_cycle: string
+          payment_method: string | null
+          transaction_id: string | null
+          status: 'completed' | 'pending' | 'failed'
+          purchased_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          subscription_id?: string | null
+          plan_id: string
+          amount: number
+          billing_cycle: string
+          payment_method?: string | null
+          transaction_id?: string | null
+          status?: 'completed' | 'pending' | 'failed'
+          purchased_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          subscription_id?: string | null
+          plan_id?: string
+          amount?: number
+          billing_cycle?: string
+          payment_method?: string | null
+          transaction_id?: string | null
+          status?: 'completed' | 'pending' | 'failed'
+          purchased_at?: string
         }
       }
       exam_questions: {
