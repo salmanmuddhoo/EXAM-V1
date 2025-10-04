@@ -15,6 +15,10 @@ interface RequestBody {
   examPaperId?: string;
   markingSchemeId?: string;
   provider?: string;
+  optimizedMode?: boolean;
+  questionNumber?: string;
+  questionText?: string;
+  questionImageUrl?: string;
 }
 
 const SYSTEM_PROMPT = `You are an expert O-Level educational AI assistant helping students understand exam questions.
@@ -63,7 +67,11 @@ Deno.serve(async (req: Request) => {
       markingSchemeImages,
       examPaperId,
       markingSchemeId,
-      provider = 'gemini'
+      provider = 'gemini',
+      optimizedMode = false,
+      questionNumber: providedQuestionNumber,
+      questionText,
+      questionImageUrl
     }: RequestBody = await req.json();
 
     if (!question) {
@@ -81,31 +89,49 @@ Deno.serve(async (req: Request) => {
 
     let finalExamImages: string[] = [];
     let finalMarkingSchemeImages: string[] = [];
-    let usedQuestionRetrieval = false;
+    let usedOptimizedMode = false;
+    let detectedQuestionNumber: string | null = null;
 
-    const questionNumber = parseQuestionNumber(question);
+    // Handle optimized mode (frontend already fetched the question image)
+    if (optimizedMode && examPaperImages && examPaperImages.length > 0) {
+      console.log(`Using OPTIMIZED mode for question ${providedQuestionNumber}`);
+      console.log(`Received ${examPaperImages.length} pre-fetched image(s)`);
+      
+      finalExamImages = examPaperImages;
+      finalMarkingSchemeImages = markingSchemeImages || [];
+      usedOptimizedMode = true;
+      detectedQuestionNumber = providedQuestionNumber || null;
+    } 
+    // Try automatic question detection and retrieval (legacy mode)
+    else {
+      const questionNumber = parseQuestionNumber(question);
 
-    if (questionNumber && examPaperId) {
-      console.log(`Detected question number: ${questionNumber}`);
-      console.log(`Attempting to retrieve question-specific images`);
+      if (questionNumber && examPaperId) {
+        console.log(`Detected question number: ${questionNumber}`);
+        console.log(`Attempting to retrieve question-specific images from database`);
 
-      const questionData = await getQuestionImages(examPaperId, questionNumber, markingSchemeId);
+        const questionData = await getQuestionImages(examPaperId, questionNumber, markingSchemeId);
 
-      if (questionData && questionData.examImages.length > 0) {
-        console.log(`Found ${questionData.examImages.length} exam images for question ${questionNumber}`);
-        console.log(`Found ${questionData.markingSchemeImages.length} marking scheme images for question ${questionNumber}`);
-        finalExamImages = questionData.examImages;
-        finalMarkingSchemeImages = questionData.markingSchemeImages;
-        usedQuestionRetrieval = true;
-      } else {
-        console.log(`Question ${questionNumber} not found in database, falling back to full PDF images`);
+        if (questionData && questionData.examImages.length > 0) {
+          console.log(`Found ${questionData.examImages.length} exam images for question ${questionNumber}`);
+          console.log(`Found ${questionData.markingSchemeImages.length} marking scheme images`);
+          finalExamImages = questionData.examImages;
+          finalMarkingSchemeImages = questionData.markingSchemeImages;
+          usedOptimizedMode = true;
+          detectedQuestionNumber = questionNumber;
+        } else {
+          console.log(`Question ${questionNumber} not found in database, falling back to full PDF`);
+        }
       }
     }
 
-    if (!usedQuestionRetrieval) {
+    // Fallback to full PDF mode
+    if (!usedOptimizedMode) {
       if (!examPaperImages || examPaperImages.length === 0) {
         return new Response(
-          JSON.stringify({ error: 'No exam paper images available. Please provide examPaperImages or ensure the paper has been processed.' }),
+          JSON.stringify({ 
+            error: 'No exam paper images available. Please provide examPaperImages or ensure the paper has been processed.' 
+          }),
           {
             status: 400,
             headers: {
@@ -116,7 +142,7 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      console.log('Using full PDF images (fallback mode)');
+      console.log(`Using FALLBACK mode: ${examPaperImages.length} exam images + ${(markingSchemeImages || []).length} marking scheme images`);
       finalExamImages = examPaperImages;
       finalMarkingSchemeImages = markingSchemeImages || [];
     }
@@ -130,9 +156,11 @@ Deno.serve(async (req: Request) => {
       },
       {
         role: 'user',
-        content: `Student's Question: ${question}\n\nPlease analyze the exam paper${markingSchemeImages.length > 0 ? ' and marking scheme' : ''} provided below and answer following the four-section structure.`,
+        content: `Student's Question: ${question}\n\nPlease analyze the exam paper${finalMarkingSchemeImages.length > 0 ? ' and marking scheme' : ''} provided below and answer following the four-section structure.`,
       },
     ];
+
+    console.log(`Sending to AI: ${finalExamImages.length} exam images + ${finalMarkingSchemeImages.length} marking scheme images`);
 
     const response = await aiProvider.generateResponse(
       messages,
@@ -145,8 +173,8 @@ Deno.serve(async (req: Request) => {
         answer: response.content,
         model: response.model,
         provider: response.provider,
-        optimized: usedQuestionRetrieval,
-        questionNumber: usedQuestionRetrieval ? questionNumber : null,
+        optimized: usedOptimizedMode,
+        questionNumber: detectedQuestionNumber,
         imagesUsed: finalExamImages.length + finalMarkingSchemeImages.length,
       }),
       {
