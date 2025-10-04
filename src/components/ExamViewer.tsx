@@ -74,6 +74,24 @@ export function ExamViewer({ paperId, conversationId, onBack, onLoginRequired }:
     }
   }, [examPaper, isMobile]);
 
+  const extractQuestionNumber = (text: string): string | null => {
+    // Match patterns like: "Question 1", "Q1", "question 1a", "Q 2b", etc.
+    const patterns = [
+      /question\s*(\d+[a-z]?)/i,
+      /q\.?\s*(\d+[a-z]?)/i,
+      /^(\d+[a-z]?)\b/i,
+    ];
+    
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) {
+        return match[1].toLowerCase();
+      }
+    }
+    
+    return null;
+  };
+
   const loadPdfBlob = async () => {
     if (!examPaper) return;
 
@@ -229,34 +247,109 @@ export function ExamViewer({ paperId, conversationId, onBack, onLoginRequired }:
 
     if (!input.trim() || sending || !examPaper) return;
 
-    if (examPaperImages.length === 0) {
-      alert('Please wait for the exam paper to finish processing.');
-      return;
-    }
-
     const userMessage = input.trim();
     setInput('');
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }]);
     setSending(true);
 
     try {
-      const requestBody: any = {
+      // Try to detect question number from user input
+      const questionNumber = extractQuestionNumber(userMessage);
+      
+      let requestBody: any = {
         question: userMessage,
         provider: 'gemini',
         examPaperId: examPaper.id,
-        examPaperImages: examPaperImages,
-        markingSchemeImages: markingSchemeImages,
       };
 
-      if (examPaper.marking_schemes) {
-        const { data: schemeData } = await supabase
-          .from('marking_schemes')
-          .select('id')
+      // Try to use optimized mode with specific question
+      if (questionNumber) {
+        console.log(`Detected question number: ${questionNumber}`);
+        
+        // Fetch the specific question from database
+        const { data: questionData, error: questionError } = await supabase
+          .from('exam_questions')
+          .select('id, question_number, ocr_text, image_url, page_numbers')
           .eq('exam_paper_id', examPaper.id)
+          .eq('question_number', questionNumber)
           .maybeSingle();
 
-        if (schemeData) {
-          requestBody.markingSchemeId = schemeData.id;
+        if (questionData && !questionError) {
+          console.log(`Found optimized question data for Q${questionNumber}`);
+          
+          // Use optimized mode - send only the specific question image
+          requestBody.optimizedMode = true;
+          requestBody.questionNumber = questionNumber;
+          requestBody.questionText = questionData.ocr_text;
+          requestBody.questionImageUrl = questionData.image_url;
+          
+          // Fetch the actual image from the URL
+          if (questionData.image_url) {
+            try {
+              const imageResponse = await fetch(questionData.image_url);
+              const imageBlob = await imageResponse.blob();
+              const reader = new FileReader();
+              
+              const base64Image = await new Promise<string>((resolve, reject) => {
+                reader.onloadend = () => {
+                  const result = reader.result as string;
+                  // Remove the data:image/jpeg;base64, prefix
+                  const base64 = result.split(',')[1];
+                  resolve(base64);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(imageBlob);
+              });
+              
+              requestBody.examPaperImages = [base64Image];
+              console.log(`Loaded question image (${base64Image.length} chars)`);
+            } catch (imageError) {
+              console.warn('Failed to load question image, falling back to full PDF mode');
+              requestBody.optimizedMode = false;
+            }
+          }
+          
+          // Check if there's a marking scheme
+          if (examPaper.marking_schemes) {
+            const { data: schemeData } = await supabase
+              .from('marking_schemes')
+              .select('id')
+              .eq('exam_paper_id', examPaper.id)
+              .maybeSingle();
+
+            if (schemeData) {
+              requestBody.markingSchemeId = schemeData.id;
+            }
+          }
+        } else {
+          console.log(`Question ${questionNumber} not found in database, using fallback mode`);
+          requestBody.optimizedMode = false;
+        }
+      }
+
+      // Fallback to full PDF mode if optimized mode not available
+      if (!requestBody.optimizedMode) {
+        console.log('Using full PDF fallback mode');
+        
+        if (examPaperImages.length === 0) {
+          alert('Please wait for the exam paper to finish processing.');
+          setSending(false);
+          return;
+        }
+        
+        requestBody.examPaperImages = examPaperImages;
+        requestBody.markingSchemeImages = markingSchemeImages;
+        
+        if (examPaper.marking_schemes) {
+          const { data: schemeData } = await supabase
+            .from('marking_schemes')
+            .select('id')
+            .eq('exam_paper_id', examPaper.id)
+            .maybeSingle();
+
+          if (schemeData) {
+            requestBody.markingSchemeId = schemeData.id;
+          }
         }
       }
 
@@ -279,11 +372,11 @@ export function ExamViewer({ paperId, conversationId, onBack, onLoginRequired }:
       const data = await response.json();
       const assistantMessage = data.answer;
 
-      if (data.optimized) {
-        console.log(`✅ Used optimized question retrieval for Question ${data.questionNumber}`);
-        console.log(`📊 Images sent to AI: ${data.imagesUsed} (instead of ${examPaperImages.length + markingSchemeImages.length})`);
+      if (requestBody.optimizedMode) {
+        console.log(`Used optimized mode: sent 1 image instead of ${examPaperImages.length + markingSchemeImages.length}`);
+        console.log(`Cost savings: approximately ${Math.round(((examPaperImages.length + markingSchemeImages.length - 1) / (examPaperImages.length + markingSchemeImages.length)) * 100)}%`);
       } else {
-        console.log(`ℹ️ Used full PDF fallback mode`);
+        console.log(`Used full PDF fallback mode (${examPaperImages.length + markingSchemeImages.length} images)`);
       }
 
       setMessages((prev) => {
