@@ -118,50 +118,37 @@ async function extractAndSplitQuestions(
   // ============================================
   // 🎯 THE AI PROMPT - CUSTOMIZE THIS
   // ============================================
-  const AI_PROMPT = `You are an expert exam paper analyzer. Your job is to extract and split all questions from this exam paper.
+  const AI_PROMPT = `You are an expert exam paper analyzer. Extract and split all questions from this exam paper.
 
-📋 TASK: Identify every single question in this exam paper and provide detailed information about each one.
+**CRITICAL: You MUST respond with ONLY a valid JSON array. No explanations, no markdown, no text before or after.**
 
-🔍 WHAT TO LOOK FOR:
-- Questions marked as "Question 1", "Q1", "1.", "1)", or similar patterns
-- Questions with sub-parts like "1(a)", "1a", "Question 1 part a"
-- Questions that span multiple pages
-- Instructions or context that belongs to a question
-
-📦 OUTPUT FORMAT:
-Return a JSON array where each question has:
-- "questionNumber": The question identifier (e.g., "1", "2a", "3")
-- "startPage": Page number where question begins (1-indexed)
-- "endPage": Page number where question ends
-- "fullText": Complete question text including all parts, sub-questions, and instructions
-- "hasSubParts": true/false - does this question have multiple parts?
-
-🎯 EXAMPLE OUTPUT:
+Identify every question and return a JSON array like this:
 [
   {
     "questionNumber": "1",
     "startPage": 1,
     "endPage": 1,
-    "fullText": "Question 1: Calculate the derivative of f(x) = x^2 + 3x + 2",
+    "fullText": "Complete question text here...",
     "hasSubParts": false
   },
   {
-    "questionNumber": "2",
+    "questionNumber": "2", 
     "startPage": 2,
     "endPage": 3,
-    "fullText": "Question 2: (a) Explain the concept of... (b) Provide an example of...",
+    "fullText": "Complete question text including all parts...",
     "hasSubParts": true
   }
 ]
 
-⚠️ IMPORTANT RULES:
-1. Extract EVERY question you find - don't skip any
-2. If a question spans multiple pages, set endPage accordingly
-3. Include the complete text - don't truncate or summarize
-4. Return ONLY valid JSON - no markdown, no explanations
-5. If you see page numbers in the images, use those; otherwise count from 1
+**RULES:**
+1. Look for "Question 1", "Q1", "1.", "1)", or similar patterns
+2. Include ALL text belonging to each question
+3. If a question spans multiple pages, set endPage accordingly
+4. Page numbers start from 1
+5. Extract EVERY question - don't skip any
+6. Return ONLY the JSON array - nothing else
 
-BEGIN ANALYSIS NOW:`;
+**YOUR RESPONSE MUST START WITH [ AND END WITH ]**`;
 
   try {
     console.log("📤 Sending to Gemini AI...");
@@ -180,10 +167,11 @@ BEGIN ANALYSIS NOW:`;
             ]
           }],
           generationConfig: {
-            temperature: 0.2,
+            temperature: 0.1,
             topP: 0.8,
             topK: 40,
-            maxOutputTokens: 8192,
+            maxOutputTokens: 16384,
+            responseMimeType: "application/json",
           }
         }),
       }
@@ -197,33 +185,77 @@ BEGIN ANALYSIS NOW:`;
 
     const data = await response.json();
     
+    console.log("📦 Full Gemini API response:", JSON.stringify(data, null, 2));
+    
     // Extract the text response
     const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     
     if (!rawText) {
-      console.error("No response from Gemini:", JSON.stringify(data, null, 2));
+      console.error("❌ No text in response!");
+      console.error("Full data:", JSON.stringify(data, null, 2));
       throw new Error("Empty response from Gemini");
     }
+    
+    // Check if response was truncated
+    const finishReason = data?.candidates?.[0]?.finishReason;
+    if (finishReason && finishReason !== 'STOP') {
+      console.warn(`⚠️ Response may be incomplete. Finish reason: ${finishReason}`);
+    }
 
-    console.log("📥 Raw Gemini response:", rawText.substring(0, 500));
+    console.log("📥 Raw Gemini response length:", rawText.length);
+    console.log("📥 Response preview:", rawText.substring(0, 500));
 
-    // Parse JSON from response (handle markdown code blocks)
+    // Parse JSON from response (handle multiple formats)
     let jsonText = rawText.trim();
     
-    // Remove markdown code blocks if present
-    if (jsonText.startsWith('```')) {
+    // Try to extract JSON from markdown code blocks
+    if (jsonText.includes('```')) {
       const match = jsonText.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
       if (match) {
         jsonText = match[1].trim();
       }
     }
+    
+    // Try to find JSON array in the text
+    if (!jsonText.startsWith('[')) {
+      const arrayMatch = jsonText.match(/\[[\s\S]*\]/);
+      if (arrayMatch) {
+        jsonText = arrayMatch[0];
+      }
+    }
+
+    // Clean up the JSON text - fix common issues
+    // Replace unicode characters that might cause issues
+    jsonText = jsonText
+      .replace(/\\n/g, ' ')  // Replace escaped newlines with spaces
+      .replace(/\n/g, ' ')   // Replace actual newlines with spaces
+      .replace(/\s+/g, ' ')  // Collapse multiple spaces
+      .trim();
+
+    console.log("📥 Cleaned JSON preview:", jsonText.substring(0, 500));
 
     let questions;
     try {
       questions = JSON.parse(jsonText);
+      console.log(`✅ Successfully parsed ${questions.length} questions`);
     } catch (parseError) {
-      console.error("JSON parse error. Raw text:", jsonText);
-      throw new Error("Failed to parse Gemini response as JSON");
+      console.error("❌ JSON parse error!");
+      console.error("Parse error message:", parseError.message);
+      console.error("Problematic JSON (first 2000 chars):", jsonText.substring(0, 2000));
+      
+      // Try one more time with a more aggressive clean
+      try {
+        const cleanedAgain = jsonText
+          .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Remove control characters
+          .replace(/\\"/g, '"')  // Fix escaped quotes
+          .replace(/\\/g, '');   // Remove remaining backslashes
+        
+        questions = JSON.parse(cleanedAgain);
+        console.log(`✅ Parsed after aggressive cleaning: ${questions.length} questions`);
+      } catch (secondError) {
+        console.error("❌ Second parse attempt also failed");
+        throw new Error(`Failed to parse Gemini response. Error: ${parseError.message}`);
+      }
     }
 
     // Validate structure
