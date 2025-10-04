@@ -10,18 +10,14 @@ const corsHeaders = {
 interface ProcessRequest {
   examPaperId: string;
   examPaperPath: string;
-  markingSchemeId?: string;
-  markingSchemePath?: string;
   pageImages: Array<{ pageNumber: number; base64Image: string }>;
-  markingSchemeImages?: Array<{ pageNumber: number; base64Image: string }>;
 }
 
-interface QuestionBoundary {
+interface QuestionData {
   questionNumber: string;
   startPage: number;
   endPage: number;
-  startY?: number;
-  endY?: number;
+  questionText: string;
 }
 
 Deno.serve(async (req: Request) => {
@@ -34,11 +30,7 @@ Deno.serve(async (req: Request) => {
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    const {
-      examPaperId,
-      pageImages,
-      markingSchemeImages = []
-    }: ProcessRequest = await req.json();
+    const { examPaperId, pageImages }: ProcessRequest = await req.json();
 
     if (!examPaperId || !pageImages || pageImages.length === 0) {
       return new Response(JSON.stringify({ error: 'Missing required fields: examPaperId and pageImages' }), {
@@ -52,47 +44,48 @@ Deno.serve(async (req: Request) => {
       throw new Error("GEMINI_API_KEY not configured");
     }
 
-    // --- Step 1: Use Gemini Vision to detect question boundaries ---
-    const questionBoundaries = await detectQuestionBoundariesWithVision(
-      pageImages,
-      geminiApiKey
-    );
+    console.log(`Processing ${pageImages.length} pages with Gemini 2.0 Flash`);
 
-    console.log(`Detected ${questionBoundaries.length} question boundaries`);
+    // Step 1: Analyze all pages with Gemini to extract question structure
+    const questions = await analyzeExamPaperWithGemini(pageImages, geminiApiKey);
+    
+    console.log(`Gemini detected ${questions.length} questions`);
 
-    // --- Step 2: Extract individual question images ---
-    const questionImages = await extractQuestionImages(
+    if (questions.length === 0) {
+      throw new Error("No questions detected by Gemini. Please check the exam paper format.");
+    }
+
+    // Step 2: Extract individual question images and upload to storage
+    const processedQuestions = await processQuestionImages(
+      questions,
       pageImages,
-      questionBoundaries,
       supabase,
       examPaperId
     );
 
-    console.log(`Extracted ${questionImages.length} question images`);
-
-    // --- Step 3: Extract text for each question using Gemini ---
-    const questionsWithText = await extractQuestionTexts(
-      questionImages,
-      geminiApiKey
-    );
-
-    // --- Step 4: Save to Supabase ---
-    for (const question of questionsWithText) {
+    // Step 3: Save to database
+    for (const question of processedQuestions) {
       await supabase.from('exam_questions').upsert({
         exam_paper_id: examPaperId,
         question_number: question.questionNumber,
         page_numbers: question.pageNumbers,
-        ocr_text: question.text,
-        image_url: question.imageUrl, // Store the cropped question image URL
-        image_base64: question.imageBase64, // Optional: store base64 if preferred
+        ocr_text: question.questionText,
+        image_url: question.imageUrl,
       }, { onConflict: 'exam_paper_id,question_number' });
     }
+
+    console.log(`Successfully saved ${processedQuestions.length} questions`);
 
     return new Response(
       JSON.stringify({
         success: true,
-        questionsCount: questionsWithText.length,
-        message: "Questions extracted and stored with individual images",
+        questionsCount: processedQuestions.length,
+        questions: processedQuestions.map(q => ({
+          number: q.questionNumber,
+          pages: q.pageNumbers,
+          hasImage: !!q.imageUrl
+        })),
+        message: "Exam paper processed successfully with Gemini 2.0 Flash",
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
@@ -107,41 +100,52 @@ Deno.serve(async (req: Request) => {
 });
 
 /**
- * Use Gemini Vision to analyze the exam paper structure and detect question boundaries
+ * Use Gemini 2.0 Flash to analyze the entire exam paper and extract all questions
  */
-async function detectQuestionBoundariesWithVision(
+async function analyzeExamPaperWithGemini(
   pageImages: Array<{ pageNumber: number; base64Image: string }>,
   geminiApiKey: string
-): Promise<QuestionBoundary[]> {
+): Promise<QuestionData[]> {
   
-  // Process first few pages to detect structure (most exams have questions on first pages)
-  const samplesToAnalyze = pageImages.slice(0, Math.min(3, pageImages.length));
-  
-  const imageParts = samplesToAnalyze.map(page => ({
+  // Prepare all page images for Gemini
+  const imageParts = pageImages.map(page => ({
     inline_data: {
       mime_type: "image/jpeg",
       data: page.base64Image
     }
   }));
 
-  const prompt = `Analyze this exam paper and identify all question boundaries.
-For each question, provide:
-- Question number (e.g., "1", "2a", "3")
-- Which page it starts on
-- Which page it ends on
+  const prompt = `You are analyzing an exam paper. Your task is to identify ALL questions in this exam.
 
-Return ONLY a JSON array in this exact format:
+For each question you find, provide:
+1. The question number (e.g., "1", "2", "3a", "4b", etc.)
+2. The page number where it STARTS
+3. The page number where it ENDS (if it spans multiple pages)
+4. The complete question text (including all parts and sub-questions)
+
+IMPORTANT:
+- Look for typical question indicators: "Question 1", "Q1", "1.", "1)", etc.
+- Some questions may span multiple pages
+- Include sub-questions (like 1a, 1b) as separate entries OR group them under the main question (your choice based on structure)
+- Page numbers start from 1
+
+Return your response as a valid JSON array in this EXACT format:
 [
-  {"questionNumber": "1", "startPage": 1, "endPage": 1},
-  {"questionNumber": "2", "startPage": 2, "endPage": 3},
-  ...
+  {
+    "questionNumber": "1",
+    "startPage": 1,
+    "endPage": 2,
+    "questionText": "Complete text of question 1..."
+  },
+  {
+    "questionNumber": "2",
+    "startPage": 3,
+    "endPage": 3,
+    "questionText": "Complete text of question 2..."
+  }
 ]
 
-Rules:
-- Look for question numbers like "Question 1", "Q1", "1.", "1)", etc.
-- Each question may span multiple pages
-- Sub-questions (1a, 1b) should be grouped under main question
-- Return valid JSON only, no markdown or explanation`;
+Return ONLY the JSON array, no markdown formatting, no explanation, no additional text.`;
 
   try {
     const response = await fetch(
@@ -156,192 +160,122 @@ Rules:
           }],
           generationConfig: {
             temperature: 0.1,
-            maxOutputTokens: 2048,
+            maxOutputTokens: 8192,
+            responseMimeType: "application/json"
           }
         }),
       }
     );
 
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Gemini API error:", errorText);
+      throw new Error(`Gemini API failed: ${response.status}`);
+    }
+
     const data = await response.json();
     const rawOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
     
-    // Clean markdown formatting if present
-    const jsonMatch = rawOutput.match(/\[[\s\S]*\]/);
-    const jsonStr = jsonMatch ? jsonMatch[0] : rawOutput;
+    console.log("Gemini raw output:", rawOutput);
     
-    const boundaries: QuestionBoundary[] = JSON.parse(jsonStr);
-    
-    // If detection failed or got incomplete results, fallback to simple page-per-question
-    if (boundaries.length === 0) {
-      console.warn("Vision detection failed, using fallback: one question per page");
-      return pageImages.map((page, idx) => ({
-        questionNumber: (idx + 1).toString(),
-        startPage: page.pageNumber,
-        endPage: page.pageNumber,
-      }));
+    // Parse JSON response
+    let questions: QuestionData[];
+    try {
+      // Remove markdown code blocks if present
+      const cleanedOutput = rawOutput.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      questions = JSON.parse(cleanedOutput);
+    } catch (parseError) {
+      console.error("Failed to parse Gemini response:", rawOutput);
+      throw new Error("Invalid JSON response from Gemini");
     }
-    
-    return boundaries;
+
+    // Validate and clean up the questions
+    const validQuestions = questions.filter(q => 
+      q.questionNumber && 
+      q.startPage && 
+      q.endPage &&
+      q.startPage <= q.endPage
+    );
+
+    if (validQuestions.length === 0) {
+      console.warn("No valid questions found in Gemini response");
+    }
+
+    return validQuestions;
+
   } catch (error) {
-    console.error("Vision detection failed:", error);
-    // Fallback: assume one question per page
-    return pageImages.map((page, idx) => ({
-      questionNumber: (idx + 1).toString(),
-      startPage: page.pageNumber,
-      endPage: page.pageNumber,
-    }));
+    console.error("Gemini analysis failed:", error);
+    throw error;
   }
 }
 
 /**
- * Extract individual question images and upload to storage
+ * Extract individual question images and upload to Supabase Storage
  */
-async function extractQuestionImages(
+async function processQuestionImages(
+  questions: QuestionData[],
   pageImages: Array<{ pageNumber: number; base64Image: string }>,
-  boundaries: QuestionBoundary[],
   supabase: any,
   examPaperId: string
 ): Promise<Array<{
   questionNumber: string;
   pageNumbers: number[];
-  imageBase64: string;
+  questionText: string;
   imageUrl: string;
 }>> {
   
   const results = [];
 
-  for (const boundary of boundaries) {
-    const relevantPages = pageImages.filter(
-      p => p.pageNumber >= boundary.startPage && p.pageNumber <= boundary.endPage
-    );
+  for (const question of questions) {
+    try {
+      // Get all pages for this question
+      const relevantPages = pageImages.filter(
+        p => p.pageNumber >= question.startPage && p.pageNumber <= question.endPage
+      );
 
-    if (relevantPages.length === 0) continue;
+      if (relevantPages.length === 0) {
+        console.warn(`No pages found for question ${question.questionNumber}`);
+        continue;
+      }
 
-    // For single-page questions, use the page image directly
-    // For multi-page questions, we'll concatenate them vertically (simplified approach)
-    let questionImage: string;
-    
-    if (relevantPages.length === 1) {
-      questionImage = relevantPages[0].base64Image;
-    } else {
-      // For multi-page questions, store first page as representative
-      // In production, you'd want to stitch images together
-      questionImage = relevantPages[0].base64Image;
-      console.log(`Question ${boundary.questionNumber} spans multiple pages, using first page`);
-    }
+      // For single-page questions, use the page directly
+      // For multi-page questions, use the first page as representative
+      // (In production, you might want to stitch images together)
+      const questionImage = relevantPages[0].base64Image;
+      const pageNumbers = relevantPages.map(p => p.pageNumber);
 
-    // Upload to Supabase Storage
-    const fileName = `${examPaperId}/question_${boundary.questionNumber}.jpg`;
-    const imageBuffer = Uint8Array.from(atob(questionImage), c => c.charCodeAt(0));
-    
-    const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('exam-questions')
-      .upload(fileName, imageBuffer, {
-        contentType: 'image/jpeg',
-        upsert: true
+      // Upload to Supabase Storage
+      const fileName = `${examPaperId}/q_${question.questionNumber.replace(/[^a-zA-Z0-9]/g, '_')}.jpg`;
+      const imageBuffer = Uint8Array.from(atob(questionImage), c => c.charCodeAt(0));
+      
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from('exam-questions')
+        .upload(fileName, imageBuffer, {
+          contentType: 'image/jpeg',
+          upsert: true
+        });
+
+      let imageUrl = '';
+      if (!uploadError && uploadData) {
+        const { data: urlData } = supabase.storage
+          .from('exam-questions')
+          .getPublicUrl(fileName);
+        imageUrl = urlData.publicUrl;
+      } else {
+        console.error(`Upload failed for question ${question.questionNumber}:`, uploadError);
+      }
+
+      results.push({
+        questionNumber: question.questionNumber,
+        pageNumbers: pageNumbers,
+        questionText: question.questionText,
+        imageUrl: imageUrl,
       });
 
-    let imageUrl = '';
-    if (!uploadError && uploadData) {
-      const { data: urlData } = supabase.storage
-        .from('exam-questions')
-        .getPublicUrl(fileName);
-      imageUrl = urlData.publicUrl;
-    }
+      console.log(`Processed question ${question.questionNumber}: pages ${pageNumbers.join(', ')}`);
 
-    results.push({
-      questionNumber: boundary.questionNumber,
-      pageNumbers: relevantPages.map(p => p.pageNumber),
-      imageBase64: questionImage,
-      imageUrl: imageUrl,
-    });
-  }
-
-  return results;
-}
-
-/**
- * Extract question text using Gemini Vision on individual question images
- */
-async function extractQuestionTexts(
-  questionImages: Array<{
-    questionNumber: string;
-    pageNumbers: number[];
-    imageBase64: string;
-    imageUrl: string;
-  }>,
-  geminiApiKey: string
-): Promise<Array<{
-  questionNumber: string;
-  pageNumbers: number[];
-  text: string;
-  imageUrl: string;
-  imageBase64: string;
-}>> {
-  
-  const results = [];
-
-  // Process in batches to avoid rate limits
-  const batchSize = 5;
-  for (let i = 0; i < questionImages.length; i += batchSize) {
-    const batch = questionImages.slice(i, i + batchSize);
-    
-    const batchPromises = batch.map(async (question) => {
-      try {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${geminiApiKey}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{
-                role: "user",
-                parts: [
-                  { text: "Extract the complete text of this exam question. Include the question number, all parts, and any instructions. Return only the question text, no additional commentary." },
-                  {
-                    inline_data: {
-                      mime_type: "image/jpeg",
-                      data: question.imageBase64
-                    }
-                  }
-                ]
-              }],
-              generationConfig: {
-                temperature: 0.1,
-                maxOutputTokens: 2048,
-              }
-            }),
-          }
-        );
-
-        const data = await response.json();
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-        return {
-          questionNumber: question.questionNumber,
-          pageNumbers: question.pageNumbers,
-          text: text,
-          imageUrl: question.imageUrl,
-          imageBase64: question.imageBase64,
-        };
-      } catch (error) {
-        console.error(`Failed to extract text for question ${question.questionNumber}:`, error);
-        return {
-          questionNumber: question.questionNumber,
-          pageNumbers: question.pageNumbers,
-          text: '',
-          imageUrl: question.imageUrl,
-          imageBase64: question.imageBase64,
-        };
-      }
-    });
-
-    const batchResults = await Promise.all(batchPromises);
-    results.push(...batchResults);
-    
-    // Small delay between batches to respect rate limits
-    if (i + batchSize < questionImages.length) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (error) {
+      console.error(`Error processing question ${question.questionNumber}:`, error);
     }
   }
 
