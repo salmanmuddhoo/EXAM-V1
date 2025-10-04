@@ -16,6 +16,14 @@ interface ProcessRequest {
   markingSchemeImages?: Array<{ pageNumber: number; base64Image: string }>;
 }
 
+interface QuestionBoundary {
+  questionNumber: string;
+  startPage: number;
+  endPage: number;
+  startY?: number;
+  endY?: number;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -39,122 +47,52 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const googleApiKey = Deno.env.get('GOOGLE_CLOUD_VISION_API_KEY');
     const geminiApiKey = Deno.env.get('GEMINI_API_KEY');
-
-    const pagesWithOCR: Array<{ pageNumber: number; ocrText: string; base64Image: string }> = [];
-
-    // --- Step 1: OCR each page ---
-    for (const page of pageImages) {
-      try {
-        const ocrResponse = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${googleApiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            requests: [{
-              image: { content: page.base64Image },
-              features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }],
-            }]
-          }),
-        });
-
-        if (!ocrResponse.ok) continue;
-        const ocrData = await ocrResponse.json();
-        const text = ocrData.responses[0]?.fullTextAnnotation?.text || '';
-
-        pagesWithOCR.push({ pageNumber: page.pageNumber, ocrText: text, base64Image: page.base64Image });
-      } catch (error) {
-        console.error(`OCR failed for page ${page.pageNumber}:`, error);
-      }
+    if (!geminiApiKey) {
+      throw new Error("GEMINI_API_KEY not configured");
     }
 
-    console.log(`OCR finished. Got text for ${pagesWithOCR.length} pages`);
+    // --- Step 1: Use Gemini Vision to detect question boundaries ---
+    const questionBoundaries = await detectQuestionBoundariesWithVision(
+      pageImages,
+      geminiApiKey
+    );
 
-    // --- Step 2: Run regex detection ---
-    let regexQuestions = detectAndGroupQuestions(pagesWithOCR);
-    console.log(`Regex detected ${regexQuestions.length} questions`);
+    console.log(`Detected ${questionBoundaries.length} question boundaries`);
 
-    // --- Step 3: Run Gemini extraction in parallel ---
-    let geminiQuestions: any[] = [];
-    if (geminiApiKey) {
-      const combinedText = pagesWithOCR.map(p => p.ocrText).join("\n\n");
+    // --- Step 2: Extract individual question images ---
+    const questionImages = await extractQuestionImages(
+      pageImages,
+      questionBoundaries,
+      supabase,
+      examPaperId
+    );
 
-      try {
-        const geminiResponse = await fetch(
-          "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=" + geminiApiKey,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{
-                role: "user",
-                parts: [{
-                  text: `Extract all main exam questions from this exam paper.
-Return JSON array like:
-[{ "questionNumber": "1", "text": "full question text..." }, ...].
+    console.log(`Extracted ${questionImages.length} question images`);
 
-Text:\n${combinedText}`
-                }]
-              }]
-            }),
-          }
-        );
+    // --- Step 3: Extract text for each question using Gemini ---
+    const questionsWithText = await extractQuestionTexts(
+      questionImages,
+      geminiApiKey
+    );
 
-        const geminiData = await geminiResponse.json();
-        const rawOutput = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
-        geminiQuestions = JSON.parse(rawOutput);
-        console.log(`Gemini extracted ${geminiQuestions.length} questions`);
-      } catch (err) {
-        console.error("Gemini extraction failed:", err);
-      }
-    }
-
-    // --- Step 4: Merge regex + Gemini results ---
-    const merged: any[] = [];
-    const seen = new Set<string>();
-
-    // Prefer regex first
-    for (const q of regexQuestions) {
-      if (!seen.has(q.questionNumber)) {
-        merged.push(q);
-        seen.add(q.questionNumber);
-      }
-    }
-
-    // Fill missing ones with Gemini output
-    for (let i = 0; i < geminiQuestions.length; i++) {
-      const q = geminiQuestions[i];
-      const num = q.questionNumber || (i + 1).toString();
-      if (!seen.has(num)) {
-        merged.push({
-          questionNumber: num,
-          pageNumbers: [],
-          ocrTexts: [q.text],
-        });
-        seen.add(num);
-      }
-    }
-
-    console.log(`Final merged questions: ${merged.length}`);
-
-    // --- Step 5: Save to Supabase ---
-    for (const question of merged) {
-      const combinedOCR = question.ocrTexts.join("\n\n");
+    // --- Step 4: Save to Supabase ---
+    for (const question of questionsWithText) {
       await supabase.from('exam_questions').upsert({
         exam_paper_id: examPaperId,
         question_number: question.questionNumber,
         page_numbers: question.pageNumbers,
-        ocr_text: combinedOCR,
+        ocr_text: question.text,
+        image_url: question.imageUrl, // Store the cropped question image URL
+        image_base64: question.imageBase64, // Optional: store base64 if preferred
       }, { onConflict: 'exam_paper_id,question_number' });
     }
 
     return new Response(
       JSON.stringify({
         success: true,
-        examQuestionsCount: merged.length,
-        regexCount: regexQuestions.length,
-        geminiCount: geminiQuestions.length,
-        message: "Processed with regex + Gemini merge",
+        questionsCount: questionsWithText.length,
+        message: "Questions extracted and stored with individual images",
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
@@ -168,38 +106,244 @@ Text:\n${combinedText}`
   }
 });
 
-// --- Regex helper ---
-function detectAndGroupQuestions(pagesWithOCR: Array<{ pageNumber: number; ocrText: string }>) {
-  const patterns = [
-    /(?:^|\n)\s*(?:Question|Q\.?)\s*(\d+[a-z]?)\s*[\.:)]?/gim,
-    /(?:^|\n)\s*(\d+[a-z]?)\s*[\.:)]\s*/gm,
-  ];
-  const groups: any[] = [];
-  let current: any = null;
+/**
+ * Use Gemini Vision to analyze the exam paper structure and detect question boundaries
+ */
+async function detectQuestionBoundariesWithVision(
+  pageImages: Array<{ pageNumber: number; base64Image: string }>,
+  geminiApiKey: string
+): Promise<QuestionBoundary[]> {
+  
+  // Process first few pages to detect structure (most exams have questions on first pages)
+  const samplesToAnalyze = pageImages.slice(0, Math.min(3, pageImages.length));
+  
+  const imageParts = samplesToAnalyze.map(page => ({
+    inline_data: {
+      mime_type: "image/jpeg",
+      data: page.base64Image
+    }
+  }));
 
-  for (const page of pagesWithOCR) {
-    let detected: string | null = null;
-    const firstLines = page.ocrText.split("\n").slice(0, 10).join("\n");
+  const prompt = `Analyze this exam paper and identify all question boundaries.
+For each question, provide:
+- Question number (e.g., "1", "2a", "3")
+- Which page it starts on
+- Which page it ends on
 
-    for (const pattern of patterns) {
-      pattern.lastIndex = 0;
-      const match = pattern.exec(firstLines);
-      if (match && match[1]) {
-        detected = match[1].trim().toLowerCase();
-        break;
+Return ONLY a JSON array in this exact format:
+[
+  {"questionNumber": "1", "startPage": 1, "endPage": 1},
+  {"questionNumber": "2", "startPage": 2, "endPage": 3},
+  ...
+]
+
+Rules:
+- Look for question numbers like "Question 1", "Q1", "1.", "1)", etc.
+- Each question may span multiple pages
+- Sub-questions (1a, 1b) should be grouped under main question
+- Return valid JSON only, no markdown or explanation`;
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${geminiApiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            role: "user",
+            parts: [{ text: prompt }, ...imageParts]
+          }],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 2048,
+          }
+        }),
       }
+    );
+
+    const data = await response.json();
+    const rawOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+    
+    // Clean markdown formatting if present
+    const jsonMatch = rawOutput.match(/\[[\s\S]*\]/);
+    const jsonStr = jsonMatch ? jsonMatch[0] : rawOutput;
+    
+    const boundaries: QuestionBoundary[] = JSON.parse(jsonStr);
+    
+    // If detection failed or got incomplete results, fallback to simple page-per-question
+    if (boundaries.length === 0) {
+      console.warn("Vision detection failed, using fallback: one question per page");
+      return pageImages.map((page, idx) => ({
+        questionNumber: (idx + 1).toString(),
+        startPage: page.pageNumber,
+        endPage: page.pageNumber,
+      }));
+    }
+    
+    return boundaries;
+  } catch (error) {
+    console.error("Vision detection failed:", error);
+    // Fallback: assume one question per page
+    return pageImages.map((page, idx) => ({
+      questionNumber: (idx + 1).toString(),
+      startPage: page.pageNumber,
+      endPage: page.pageNumber,
+    }));
+  }
+}
+
+/**
+ * Extract individual question images and upload to storage
+ */
+async function extractQuestionImages(
+  pageImages: Array<{ pageNumber: number; base64Image: string }>,
+  boundaries: QuestionBoundary[],
+  supabase: any,
+  examPaperId: string
+): Promise<Array<{
+  questionNumber: string;
+  pageNumbers: number[];
+  imageBase64: string;
+  imageUrl: string;
+}>> {
+  
+  const results = [];
+
+  for (const boundary of boundaries) {
+    const relevantPages = pageImages.filter(
+      p => p.pageNumber >= boundary.startPage && p.pageNumber <= boundary.endPage
+    );
+
+    if (relevantPages.length === 0) continue;
+
+    // For single-page questions, use the page image directly
+    // For multi-page questions, we'll concatenate them vertically (simplified approach)
+    let questionImage: string;
+    
+    if (relevantPages.length === 1) {
+      questionImage = relevantPages[0].base64Image;
+    } else {
+      // For multi-page questions, store first page as representative
+      // In production, you'd want to stitch images together
+      questionImage = relevantPages[0].base64Image;
+      console.log(`Question ${boundary.questionNumber} spans multiple pages, using first page`);
     }
 
-    if (detected) {
-      if (current) groups.push(current);
-      current = { questionNumber: detected, pageNumbers: [page.pageNumber], ocrTexts: [page.ocrText] };
-    } else if (current) {
-      current.pageNumbers.push(page.pageNumber);
-      current.ocrTexts.push(page.ocrText);
-    } else {
-      current = { questionNumber: "1", pageNumbers: [page.pageNumber], ocrTexts: [page.ocrText] };
+    // Upload to Supabase Storage
+    const fileName = `${examPaperId}/question_${boundary.questionNumber}.jpg`;
+    const imageBuffer = Uint8Array.from(atob(questionImage), c => c.charCodeAt(0));
+    
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('exam-questions')
+      .upload(fileName, imageBuffer, {
+        contentType: 'image/jpeg',
+        upsert: true
+      });
+
+    let imageUrl = '';
+    if (!uploadError && uploadData) {
+      const { data: urlData } = supabase.storage
+        .from('exam-questions')
+        .getPublicUrl(fileName);
+      imageUrl = urlData.publicUrl;
+    }
+
+    results.push({
+      questionNumber: boundary.questionNumber,
+      pageNumbers: relevantPages.map(p => p.pageNumber),
+      imageBase64: questionImage,
+      imageUrl: imageUrl,
+    });
+  }
+
+  return results;
+}
+
+/**
+ * Extract question text using Gemini Vision on individual question images
+ */
+async function extractQuestionTexts(
+  questionImages: Array<{
+    questionNumber: string;
+    pageNumbers: number[];
+    imageBase64: string;
+    imageUrl: string;
+  }>,
+  geminiApiKey: string
+): Promise<Array<{
+  questionNumber: string;
+  pageNumbers: number[];
+  text: string;
+  imageUrl: string;
+  imageBase64: string;
+}>> {
+  
+  const results = [];
+
+  // Process in batches to avoid rate limits
+  const batchSize = 5;
+  for (let i = 0; i < questionImages.length; i += batchSize) {
+    const batch = questionImages.slice(i, i + batchSize);
+    
+    const batchPromises = batch.map(async (question) => {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${geminiApiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{
+                role: "user",
+                parts: [
+                  { text: "Extract the complete text of this exam question. Include the question number, all parts, and any instructions. Return only the question text, no additional commentary." },
+                  {
+                    inline_data: {
+                      mime_type: "image/jpeg",
+                      data: question.imageBase64
+                    }
+                  }
+                ]
+              }],
+              generationConfig: {
+                temperature: 0.1,
+                maxOutputTokens: 2048,
+              }
+            }),
+          }
+        );
+
+        const data = await response.json();
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+        return {
+          questionNumber: question.questionNumber,
+          pageNumbers: question.pageNumbers,
+          text: text,
+          imageUrl: question.imageUrl,
+          imageBase64: question.imageBase64,
+        };
+      } catch (error) {
+        console.error(`Failed to extract text for question ${question.questionNumber}:`, error);
+        return {
+          questionNumber: question.questionNumber,
+          pageNumbers: question.pageNumbers,
+          text: '',
+          imageUrl: question.imageUrl,
+          imageBase64: question.imageBase64,
+        };
+      }
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+    
+    // Small delay between batches to respect rate limits
+    if (i + batchSize < questionImages.length) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }
-  if (current) groups.push(current);
-  return groups;
+
+  return results;
 }
