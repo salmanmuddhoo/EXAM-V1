@@ -306,7 +306,8 @@ try {
 
 
   
-      
+   /*   old code
+   
       catch (processingError) {
         console.warn('Processing error (non-fatal):', processingError);
         setProcessingStatus('');
@@ -317,6 +318,11 @@ try {
         fetchData();
         alert('Exam paper uploaded successfully! Note: Automatic question processing failed. The paper will use full PDF mode.');
       }
+      
+End old code*/
+
+    
+    
     } catch (error: any) {
       alert(error.message);
     } finally {
