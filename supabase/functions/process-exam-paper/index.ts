@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
+import { createCanvas, loadImage } from 'npm:canvas@2.11.2';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -68,15 +69,47 @@ Deno.serve(async (req: Request) => {
     // ============================================
     // STEP 3: Save to database
     // ============================================
+    console.log(`💾 Saving ${savedQuestions.length} questions to database...`);
+    
+    let savedCount = 0;
+    let errorCount = 0;
+    
     for (const q of savedQuestions) {
-      await supabase.from('exam_questions').upsert({
+      console.log(`Saving question ${q.questionNumber}...`);
+      console.log(`Data being saved:`, JSON.stringify({
         exam_paper_id: examPaperId,
         question_number: q.questionNumber,
         page_numbers: q.pageNumbers,
-        ocr_text: q.fullText,
-        image_url: q.imageUrl,
-      }, { onConflict: 'exam_paper_id,question_number' });
+        ocr_text: q.fullText?.substring(0, 50),
+        image_url: q.imageUrl
+      }, null, 2));
+      
+      // Ensure page_numbers is an array
+      const pageNumbersArray = Array.isArray(q.pageNumbers) ? q.pageNumbers : [q.pageNumbers];
+      
+      const insertData = {
+        exam_paper_id: examPaperId,
+        question_number: String(q.questionNumber),
+        page_numbers: pageNumbersArray,
+        ocr_text: q.fullText || '',
+        image_url: q.imageUrl || '',
+      };
+      
+      console.log(`Insert data:`, JSON.stringify(insertData, null, 2));
+      
+      const { data, error } = await supabase.from('exam_questions').insert(insertData);
+      
+      if (error) {
+        console.error(`❌ Failed to save question ${q.questionNumber}:`, error);
+        console.error(`Error details:`, JSON.stringify(error, null, 2));
+        errorCount++;
+      } else {
+        console.log(`✅ Saved question ${q.questionNumber} to database`);
+        savedCount++;
+      }
     }
+    
+    console.log(`💾 Database save complete: ${savedCount} saved, ${errorCount} errors`);
 
     return new Response(
       JSON.stringify({
@@ -346,6 +379,103 @@ async function extractFullTextForQuestions(
 }
 
 /**
+ * Crop barcode area from top of image (typically 10-15% of height)
+ */
+function cropBarcodeFromBase64(base64Image: string, cropPercentage: number = 12): Promise<string> {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Convert base64 to buffer
+      const imageBuffer = Buffer.from(base64Image, 'base64');
+      
+      // Load image
+      const img = await loadImage(imageBuffer);
+      
+      // Calculate crop dimensions
+      const cropHeight = Math.floor(img.height * (cropPercentage / 100));
+      const newHeight = img.height - cropHeight;
+      
+      // Create canvas with new dimensions
+      const canvas = createCanvas(img.width, newHeight);
+      const ctx = canvas.getContext('2d');
+      
+      // Draw image without the top barcode area
+      ctx.drawImage(
+        img,
+        0, cropHeight, img.width, newHeight, // Source: skip top portion
+        0, 0, img.width, newHeight           // Destination: full new canvas
+      );
+      
+      // Convert back to base64
+      const croppedBase64 = canvas.toBuffer('image/jpeg', { quality: 0.95 }).toString('base64');
+      resolve(croppedBase64);
+    } catch (error) {
+      console.error('Error cropping barcode:', error);
+      // If cropping fails, return original
+      resolve(base64Image);
+    }
+  });
+}
+
+/**
+ * Stitch multiple page images vertically into one image
+ */
+async function stitchImagesVertically(base64Images: string[]): Promise<string> {
+  try {
+    if (base64Images.length === 0) {
+      throw new Error('No images to stitch');
+    }
+    
+    if (base64Images.length === 1) {
+      // Single page - just crop barcode
+      return await cropBarcodeFromBase64(base64Images[0]);
+    }
+    
+    console.log(`Stitching ${base64Images.length} images together...`);
+    
+    // Load all images and crop barcodes
+    const images = [];
+    for (let i = 0; i < base64Images.length; i++) {
+      const croppedBase64 = await cropBarcodeFromBase64(base64Images[i]);
+      const imageBuffer = Buffer.from(croppedBase64, 'base64');
+      const img = await loadImage(imageBuffer);
+      images.push(img);
+      console.log(`Loaded image ${i + 1}: ${img.width}x${img.height}`);
+    }
+    
+    // Calculate total dimensions
+    const maxWidth = Math.max(...images.map(img => img.width));
+    const totalHeight = images.reduce((sum, img) => sum + img.height, 0);
+    
+    console.log(`Creating stitched canvas: ${maxWidth}x${totalHeight}`);
+    
+    // Create canvas for stitched image
+    const canvas = createCanvas(maxWidth, totalHeight);
+    const ctx = canvas.getContext('2d');
+    
+    // Fill with white background
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, maxWidth, totalHeight);
+    
+    // Draw all images vertically
+    let currentY = 0;
+    for (const img of images) {
+      // Center image horizontally if it's narrower than canvas
+      const x = (maxWidth - img.width) / 2;
+      ctx.drawImage(img, x, currentY);
+      currentY += img.height;
+    }
+    
+    // Convert to base64
+    const stitchedBase64 = canvas.toBuffer('image/jpeg', { quality: 0.92 }).toString('base64');
+    console.log(`Stitched image size: ${stitchedBase64.length} chars`);
+    
+    return stitchedBase64;
+  } catch (error) {
+    console.error('Error stitching images:', error);
+    throw error;
+  }
+}
+/**
  * Save individual question images to Supabase Storage
  */
 async function saveQuestionImages(
@@ -366,20 +496,24 @@ async function saveQuestionImages(
       );
 
       if (relevantPages.length === 0) {
-        console.warn(`⚠️ No pages found for question ${question.questionNumber}`);
+        console.warn(`No pages found for question ${question.questionNumber}`);
         continue;
       }
 
-      // Use first page as representative image
-      // TODO: For multi-page questions, consider stitching images together
-      const questionImageBase64 = relevantPages[0].base64Image;
+      console.log(`Processing question ${question.questionNumber}: ${relevantPages.length} page(s)`);
+
+      // Stitch pages together (includes barcode cropping)
+      const base64ImagesToStitch = relevantPages.map(p => p.base64Image);
+      const stitchedImage = await stitchImagesVertically(base64ImagesToStitch);
       
       // Clean question number for filename (remove special chars)
       const cleanQuestionNum = question.questionNumber.replace(/[^a-zA-Z0-9]/g, '_');
       const fileName = `${examPaperId}/question_${cleanQuestionNum}.jpg`;
       
       // Convert base64 to buffer
-      const imageBuffer = Uint8Array.from(atob(questionImageBase64), c => c.charCodeAt(0));
+      const imageBuffer = Uint8Array.from(atob(stitchedImage), c => c.charCodeAt(0));
+      
+      console.log(`Uploading ${fileName} (${imageBuffer.length} bytes)...`);
       
       // Upload to Supabase Storage
       const { error: uploadError } = await supabase.storage
@@ -399,17 +533,21 @@ async function saveQuestionImages(
         .from('exam-questions')
         .getPublicUrl(fileName);
 
-      results.push({
+      const questionResult = {
         questionNumber: question.questionNumber,
         pageNumbers: relevantPages.map(p => p.pageNumber),
         fullText: question.fullText,
         imageUrl: urlData.publicUrl,
-      });
+      };
+      
+      console.log(`Question ${question.questionNumber} data:`, JSON.stringify(questionResult, null, 2));
+      
+      results.push(questionResult);
 
-      console.log(`✅ Saved question ${question.questionNumber}`);
+      console.log(`Saved question ${question.questionNumber}`);
 
     } catch (error) {
-      console.error(`❌ Failed to save question ${question.questionNumber}:`, error);
+      console.error(`Failed to save question ${question.questionNumber}:`, error);
     }
   }
 
