@@ -1,6 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
-import { createCanvas, loadImage } from 'npm:canvas@2.11.2';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -76,23 +75,18 @@ Deno.serve(async (req: Request) => {
     
     for (const q of savedQuestions) {
       console.log(`Saving question ${q.questionNumber}...`);
-      console.log(`Data being saved:`, JSON.stringify({
-        exam_paper_id: examPaperId,
-        question_number: q.questionNumber,
-        page_numbers: q.pageNumbers,
-        ocr_text: q.fullText?.substring(0, 50),
-        image_url: q.imageUrl
-      }, null, 2));
       
       // Ensure page_numbers is an array
       const pageNumbersArray = Array.isArray(q.pageNumbers) ? q.pageNumbers : [q.pageNumbers];
+      const imageUrlsArray = Array.isArray(q.imageUrls) ? q.imageUrls : [q.imageUrl];
       
       const insertData = {
         exam_paper_id: examPaperId,
         question_number: String(q.questionNumber),
         page_numbers: pageNumbersArray,
         ocr_text: q.fullText || '',
-        image_url: q.imageUrl || '',
+        image_url: q.imageUrl || '', // First URL for backward compatibility
+        image_urls: imageUrlsArray, // All URLs
       };
       
       console.log(`Insert data:`, JSON.stringify(insertData, null, 2));
