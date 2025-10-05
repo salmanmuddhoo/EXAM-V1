@@ -449,3 +449,7 @@ BEGIN
     updated_at = now();
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+ALTER TABLE exam_questions 
+ADD COLUMN IF NOT EXISTS image_urls TEXT[];
